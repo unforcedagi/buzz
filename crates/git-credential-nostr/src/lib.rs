@@ -47,28 +47,39 @@ fn check_keyfile_permissions(path: &str) -> Result<(), String> {
 /// Max keyfile size — nsec1 is 63 bytes; hex keys are 64 bytes. 256 is generous.
 const MAX_KEYFILE_BYTES: u64 = 256;
 
+/// Resolution order: `$NOSTR_PRIVATE_KEY`, then `git config nostr.keyfile`,
+/// then `$BUZZ_PRIVATE_KEY`. The first two are explicit user configuration;
+/// the last is the identity Buzz's ACP harness injects into managed agent
+/// subprocesses (see `buzz-acp`), so an agent with no Nostr-specific setup
+/// can still authenticate against Buzz-hosted git remotes with its own key.
 fn load_key() -> Result<String, String> {
     if let Ok(val) = std::env::var("NOSTR_PRIVATE_KEY") {
         if !val.is_empty() {
             return Ok(val);
         }
     }
-    let path = git_config("nostr.keyfile").ok_or_else(|| {
-        "no nostr key configured. Set $NOSTR_PRIVATE_KEY or git config nostr.keyfile".to_string()
-    })?;
-    check_keyfile_permissions(&path)?;
-    let meta = std::fs::metadata(&path).map_err(|e| format!("cannot stat keyfile {path}: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("keyfile {path} is not a regular file"));
+    if let Some(path) = git_config("nostr.keyfile") {
+        check_keyfile_permissions(&path)?;
+        let meta =
+            std::fs::metadata(&path).map_err(|e| format!("cannot stat keyfile {path}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("keyfile {path} is not a regular file"));
+        }
+        if meta.len() > MAX_KEYFILE_BYTES {
+            return Err(format!(
+                "keyfile {path} exceeds {MAX_KEYFILE_BYTES}-byte size limit"
+            ));
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read keyfile {path}: {e}"))?;
+        return Ok(raw.trim().to_string());
     }
-    if meta.len() > MAX_KEYFILE_BYTES {
-        return Err(format!(
-            "keyfile {path} exceeds {MAX_KEYFILE_BYTES}-byte size limit"
-        ));
+    if let Ok(val) = std::env::var("BUZZ_PRIVATE_KEY") {
+        if !val.is_empty() {
+            return Ok(val);
+        }
     }
-    let raw =
-        std::fs::read_to_string(&path).map_err(|e| format!("cannot read keyfile {path}: {e}"))?;
-    Ok(raw.trim().to_string())
+    Err("no nostr key configured. Set $NOSTR_PRIVATE_KEY, git config nostr.keyfile, or run as a Buzz-managed agent (falls back to $BUZZ_PRIVATE_KEY)".to_string())
 }
 
 /// Load the NIP-OA owner attestation injected by Buzz Desktop/ACP.

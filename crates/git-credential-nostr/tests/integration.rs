@@ -11,7 +11,10 @@ use nostr::{Keys, ToBech32};
 
 /// Spawn the binary, write `input` to stdin, collect output.
 /// `env_vars` are added on top of the inherited environment.
-/// `NOSTR_PRIVATE_KEY` is always cleared first to prevent test pollution.
+/// `NOSTR_PRIVATE_KEY` and `BUZZ_PRIVATE_KEY` are always cleared first to
+/// prevent test pollution — both from the ambient test environment (e.g. an
+/// agent running this suite may itself be a Buzz-managed agent with
+/// `$BUZZ_PRIVATE_KEY` set) and from prior test runs.
 fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_git-credential-nostr");
     let mut cmd = Command::new(bin);
@@ -20,6 +23,7 @@ fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
         .stderr(Stdio::piped())
         .current_dir(std::env::temp_dir())
         .env_remove("NOSTR_PRIVATE_KEY")
+        .env_remove("BUZZ_PRIVATE_KEY")
         .env_remove("BUZZ_AUTH_TAG")
         .env_remove("GIT_CONFIG_COUNT")
         // Prevent git config on the test machine from supplying credentials.
@@ -43,6 +47,52 @@ fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
 fn fresh_nsec() -> String {
     let keys = Keys::generate();
     keys.secret_key().to_bech32().unwrap()
+}
+
+/// Decode the signed NIP-98 event out of a successful helper run's stdout.
+fn extract_event(stdout: &str) -> nostr::Event {
+    let credential = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("credential="))
+        .expect("credential output");
+    let event_json = base64::engine::general_purpose::STANDARD
+        .decode(credential)
+        .expect("base64 credential");
+    serde_json::from_slice(&event_json).expect("NIP-98 event")
+}
+
+/// Write `nsec` to a temp keyfile with the given permissions and point a
+/// scratch git config at it via `nostr.keyfile`. Returns
+/// `(keyfile, git_config_dir, git_config_file)`; the caller is responsible
+/// for cleanup after the subprocess runs.
+#[cfg(unix)]
+fn write_temp_keyfile(
+    nsec: &str,
+    mode: u32,
+) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp_dir = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+
+    let keyfile = tmp_dir.join(format!("nostr-test-key-{nonce}.nsec"));
+    std::fs::write(&keyfile, nsec).expect("failed to write temp keyfile");
+    std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(mode))
+        .expect("failed to set permissions");
+
+    let git_config_dir = tmp_dir.join(format!("nostr-test-gitconfig-{nonce}"));
+    std::fs::create_dir_all(&git_config_dir).unwrap();
+    let git_config_file = git_config_dir.join(".gitconfig");
+    std::fs::write(
+        &git_config_file,
+        format!("[nostr]\n\tkeyfile = {}\n", keyfile.display()),
+    )
+    .expect("failed to write git config");
+
+    (keyfile, git_config_dir, git_config_file)
 }
 
 /// Standard valid credential-helper input (includes authtype capability).
@@ -231,6 +281,107 @@ fn missing_key() {
         stderr.contains("no nostr key configured"),
         "expected 'no nostr key configured' in stderr, got:\n{stderr}"
     );
+    assert!(
+        stderr.contains("BUZZ_PRIVATE_KEY"),
+        "expected the error to mention the BUZZ_PRIVATE_KEY fallback, got:\n{stderr}"
+    );
+}
+
+/// `$BUZZ_PRIVATE_KEY` is used when neither `$NOSTR_PRIVATE_KEY` nor
+/// `nostr.keyfile` is configured — the case Buzz-managed agents hit when
+/// pushing to Buzz-hosted git remotes with only their ACP-injected identity
+/// (see `buzz-acp`'s `propagate_legacy_env_vars`).
+#[test]
+fn falls_back_to_buzz_private_key() {
+    let keys = Keys::generate();
+    let nsec = keys.secret_key().to_bech32().unwrap();
+    let out = run_helper(&valid_input(), &[("BUZZ_PRIVATE_KEY", &nsec)]);
+
+    assert!(
+        out.status.success(),
+        "expected exit 0 via BUZZ_PRIVATE_KEY fallback, got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let event = extract_event(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        event.pubkey,
+        keys.public_key(),
+        "expected event signed with the BUZZ_PRIVATE_KEY fallback key"
+    );
+}
+
+/// Resolution order: `$NOSTR_PRIVATE_KEY` beats `$BUZZ_PRIVATE_KEY` even when
+/// both are set. Explicit env configuration must not be silently overridden
+/// by the agent's ambient Buzz identity.
+#[test]
+fn nostr_private_key_takes_precedence_over_buzz_private_key() {
+    let explicit_keys = Keys::generate();
+    let buzz_keys = Keys::generate();
+    let explicit_nsec = explicit_keys.secret_key().to_bech32().unwrap();
+    let buzz_nsec = buzz_keys.secret_key().to_bech32().unwrap();
+
+    let out = run_helper(
+        &valid_input(),
+        &[
+            ("NOSTR_PRIVATE_KEY", &explicit_nsec),
+            ("BUZZ_PRIVATE_KEY", &buzz_nsec),
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let event = extract_event(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        event.pubkey,
+        explicit_keys.public_key(),
+        "expected event signed with $NOSTR_PRIVATE_KEY, not $BUZZ_PRIVATE_KEY"
+    );
+}
+
+/// Resolution order: `nostr.keyfile` beats `$BUZZ_PRIVATE_KEY` when both are
+/// present. An explicit keyfile is deliberate user configuration and must
+/// not be silently overridden by the agent's ambient Buzz identity.
+#[cfg(unix)]
+#[test]
+fn keyfile_takes_precedence_over_buzz_private_key() {
+    let keyfile_keys = Keys::generate();
+    let buzz_keys = Keys::generate();
+    let keyfile_nsec = keyfile_keys.secret_key().to_bech32().unwrap();
+    let buzz_nsec = buzz_keys.secret_key().to_bech32().unwrap();
+
+    let (keyfile, git_config_dir, git_config_file) = write_temp_keyfile(&keyfile_nsec, 0o600);
+
+    let out = run_helper(
+        &valid_input(),
+        &[
+            ("HOME", git_config_dir.to_str().unwrap()),
+            ("GIT_CONFIG_GLOBAL", git_config_file.to_str().unwrap()),
+            ("BUZZ_PRIVATE_KEY", &buzz_nsec),
+        ],
+    );
+
+    let _ = std::fs::remove_file(&keyfile);
+    let _ = std::fs::remove_file(&git_config_file);
+    let _ = std::fs::remove_dir(&git_config_dir);
+
+    assert!(
+        out.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let event = extract_event(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        event.pubkey,
+        keyfile_keys.public_key(),
+        "expected event signed with nostr.keyfile, not $BUZZ_PRIVATE_KEY"
+    );
 }
 
 /// `wwwauth[]` present but missing `method="..."` → exit 0, no credential emitted.
@@ -294,40 +445,10 @@ fn missing_path() {
 #[cfg(unix)]
 #[test]
 fn bad_keyfile_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-
     let nsec = fresh_nsec();
 
-    // Write keyfile to a temp path.
-    let tmp_dir = std::env::temp_dir();
-    let keyfile = tmp_dir.join(format!(
-        "nostr-test-key-{}.nsec",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::write(&keyfile, &nsec).expect("failed to write temp keyfile");
-
-    // Set insecure permissions (0644).
-    std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o644))
-        .expect("failed to set permissions");
-
-    // Point a scratch git config at the keyfile.
-    let git_config_dir = tmp_dir.join(format!(
-        "nostr-test-gitconfig-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::create_dir_all(&git_config_dir).unwrap();
-    let git_config_file = git_config_dir.join(".gitconfig");
-    std::fs::write(
-        &git_config_file,
-        format!("[nostr]\n\tkeyfile = {}\n", keyfile.display()),
-    )
-    .expect("failed to write git config");
+    // Insecure permissions (0644) on a keyfile pointed to by a scratch git config.
+    let (keyfile, git_config_dir, git_config_file) = write_temp_keyfile(&nsec, 0o644);
 
     let out = run_helper(
         &valid_input(),

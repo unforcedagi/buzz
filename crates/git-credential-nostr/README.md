@@ -38,6 +38,17 @@ export NOSTR_PRIVATE_KEY=nsec1...
 git clone https://relay.example.com/git/owner/repo.git
 ```
 
+## Buzz-managed agents
+
+If neither `$NOSTR_PRIVATE_KEY` nor `nostr.keyfile` is set, the helper falls
+back to `$BUZZ_PRIVATE_KEY` — the identity Buzz's ACP harness already injects
+into managed agent subprocesses. This lets an agent push to Buzz-hosted git
+repos with its own key without any Nostr-specific setup. Resolution order:
+
+1. `$NOSTR_PRIVATE_KEY`
+2. `git config nostr.keyfile`
+3. `$BUZZ_PRIVATE_KEY`
+
 ## How It Works
 
 When a Buzz git server returns `HTTP 401` with a
@@ -61,7 +72,7 @@ git ──stdin──▶ git-credential-nostr ──stdout──▶ git
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `no nostr key configured` | Neither `$NOSTR_PRIVATE_KEY` nor `nostr.keyfile` is set | Follow the Setup steps above |
+| `no nostr key configured` | None of `$NOSTR_PRIVATE_KEY`, `nostr.keyfile`, or `$BUZZ_PRIVATE_KEY` is set | Follow the Setup steps above, or run under a Buzz-managed agent |
 | `insecure permissions` | Key file is readable by group/others | `chmod 600 ~/.nostr/key` |
 | `method hint` | Server's `WWW-Authenticate` header is missing `method="..."` | Upgrade the Buzz server |
 | `useHttpPath` | `credential.useHttpPath` is not set | `git config --global credential.useHttpPath true` |
