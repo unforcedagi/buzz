@@ -1,4 +1,5 @@
 import * as React from "react";
+import { ConnectedWorkspace } from "@/features/connected-workspace/ConnectedWorkspace";
 import { ProtectedGlobalOverlay } from "@protected-feature-components";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -112,6 +113,7 @@ export function AppShell() {
   useTauriWindowDrag();
   useWebviewScrollBoundaryLock();
   const communitiesHook = useCommunities();
+  const [connectedDockWidth, setConnectedDockWidth] = React.useState(0);
   const {
     handleHuddleCompanionOpen,
     handleHuddleEnded,
@@ -771,11 +773,23 @@ export function AppShell() {
             <SidebarProvider
               className="relative z-10 min-h-0 min-w-0 flex-1 flex-col overflow-visible"
               data-testid="app-sidebar-layer"
+              style={{ paddingRight: connectedDockWidth }}
             >
               <AppProfilePanelProvider>
                 <AppWorkflowEditorOverlayProvider>
                   {!settingsOpen && !isHuddleRoom ? (
                     <AppTopChrome
+                      connectedWorkspace={
+                        <ConnectedWorkspace
+                          onDockWidth={setConnectedDockWidth}
+                          pubkey={identityQuery.data?.pubkey || ""}
+                          key={`${identityQuery.data?.pubkey}:${communitiesHook.activeCommunity?.relayUrl}`}
+                          relay={
+                            communitiesHook.activeCommunity?.relayUrl || ""
+                          }
+                          channelId={selectedChannelId}
+                        />
+                      }
                       canGoBack={canGoBack}
                       canGoForward={canGoForward}
                       hasCommunityRail={hasCommunityRail}

@@ -521,6 +521,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            fleet_request,
+            connected_mcp_request,
+            connected_app_open,
+            connected_app_bounds,
+            connected_app_close,
+            connected_app_location,
+            connected_parachute_sign_in,
             terminal_runtime::terminal_attach,
             terminal_runtime::terminal_detach,
             terminal_runtime::terminal_close,

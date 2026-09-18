@@ -1133,6 +1133,7 @@ dependencies = [
  "plist",
  "png 0.18.1",
  "portable-pty",
+ "process-wrap",
  "regex",
  "reqwest 0.13.4",
  "rodio",

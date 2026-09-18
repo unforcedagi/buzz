@@ -1,0 +1,8 @@
+{
+  "productName": "Buzz Connected Lab",
+  "identifier": "coop.techne.buzz.connected-lab",
+  "plugins": {
+    "deep-link": { "desktop": { "schemes": ["buzz-demo-connected-lab"] } }
+  },
+  "bundle": { "active": false, "externalBin": [] }
+}
