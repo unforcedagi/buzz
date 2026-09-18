@@ -61,9 +61,9 @@ export function applyConnection(
 
 /** One encrypted NIP-78 record per connection; independent additions cannot overwrite each other. */
 export class ConnectionSync {
+  private pubkey: string;
   private retired = false;
   private heads = new Map<string, RelayEvent>();
-  private pubkey: string;
   constructor(pubkey: string) {
     this.pubkey = pubkey;
   }
