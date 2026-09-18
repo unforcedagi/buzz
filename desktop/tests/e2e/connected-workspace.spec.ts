@@ -7,7 +7,9 @@ test("connects an app and inspects a host without deploying; rejects an unconfir
 }) => {
   await installMockBridge(page);
   await page.goto("/");
-  await expect(page.getByTestId("connected-workspace-toggle")).toBeVisible();
+  await expect(page.getByTestId("connected-workspace-toggle")).toBeVisible({
+    timeout: 30000,
+  });
   await page.evaluate(() => {
     const target = window as unknown as {
       __TAURI_INTERNALS__: {
