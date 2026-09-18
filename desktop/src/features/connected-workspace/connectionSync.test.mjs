@@ -5,7 +5,7 @@ import {
   connectionChanges,
   ConnectionSync,
 } from "./connectionSync.ts";
-import { relayClient } from "../../../shared/api/relayClient.ts";
+import { relayClient } from "../../shared/api/relayClient.ts";
 const empty = { version: 1, apps: [], hosts: [] };
 const app = {
   id: "notes",

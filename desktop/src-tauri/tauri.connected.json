@@ -4,5 +4,10 @@
   "plugins": {
     "deep-link": { "desktop": { "schemes": ["buzz-demo-connected-lab"] } }
   },
-  "bundle": { "active": false, "externalBin": [] }
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "externalBin": [],
+    "macOS": { "infoPlist": "Info.connected.plist" }
+  }
 }

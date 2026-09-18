@@ -63,7 +63,10 @@ export function applyConnection(
 export class ConnectionSync {
   private retired = false;
   private heads = new Map<string, RelayEvent>();
-  constructor(private pubkey: string) {}
+  private pubkey: string;
+  constructor(pubkey: string) {
+    this.pubkey = pubkey;
+  }
   destroy() {
     this.retired = true;
   }
