@@ -14,6 +14,7 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../../shared/animated_avatar.dart';
 import '../../shared/emoji/emoji_burst.dart';
 import '../../shared/huddle/huddle.dart';
+import '../../shared/last_conversation/last_conversation_storage.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
@@ -282,6 +283,16 @@ class ChannelDetailPage extends HookConsumerWidget {
     final initialOldestOrdinaryUnreadMessageIdRef = useRef<String?>(null);
     final initialForcedUnreadMessageIdsRef = useRef<Set<String>>(const {});
     final didCaptureInitialReadAt = useRef(false);
+    final readStatePubkey = ref.watch(
+      readStateProvider.select((state) => state.pubkey),
+    );
+    useEffect(() {
+      if (readStatePubkey == null) return null;
+      ref
+          .read(lastConversationStorageProvider)
+          .write(readStatePubkey, channel.id);
+      return null;
+    }, [channel.id, readStatePubkey]);
     if (readState.isReady && !didCaptureInitialReadAt.value) {
       final channelReadAt = readState.effectiveTimestamp(channel.id);
       final ordinaryUnreadEvents = [

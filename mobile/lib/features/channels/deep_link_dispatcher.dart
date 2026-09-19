@@ -5,6 +5,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/deeplink/deep_link.dart';
 import '../../shared/deeplink/pending_deep_link_provider.dart';
+import '../../shared/last_conversation/last_conversation_storage.dart';
+import '../../shared/read_state/read_state_provider.dart';
 import '../invites/invite_join_provider.dart';
 import '../invites/invite_join_sheet.dart';
 import 'channel.dart';
@@ -39,13 +41,25 @@ class DeepLinkDispatcher extends ConsumerStatefulWidget {
 
 class _DeepLinkDispatcherState extends ConsumerState<DeepLinkDispatcher> {
   bool _preparingInvite = false;
+  bool _lastConversationRestored = false;
+  bool _listeningIdentityPubkey = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      // Snapshot before dispatch: a channel deep link is consumed
+      // synchronously, so restore afterwards would see pending == null and
+      // push a second navigation on cold start. When a link was pending, it
+      // owns this launch — spend the one-shot on it.
+      final hadPendingLink = ref.read(pendingDeepLinkProvider) != null;
       _maybeDispatch(ref.read(pendingDeepLinkProvider));
+      if (hadPendingLink) {
+        _lastConversationRestored = true;
+        return;
+      }
+      _maybeRestoreLastConversation();
     });
   }
 
@@ -55,13 +69,80 @@ class _DeepLinkDispatcherState extends ConsumerState<DeepLinkDispatcher> {
     ref.listen<BuzzDeepLink?>(pendingDeepLinkProvider, (_, link) {
       _maybeDispatch(link);
     });
+    // Identity can become ready after the first channels load; when a restore
+    // attempt hits that case, _maybeRestoreLastConversation subscribes to the
+    // pubkey so the restore retries on its own instead of waiting for a
+    // channels refresh.
     if (widget.dispatchMessageLinks) {
       ref.listen<AsyncValue<List<Channel>>>(channelsProvider, (_, _) {
+        // Dispatch runs first and may consume a pending link synchronously;
+        // when a link was pending on this pass it owns the launch — spend the
+        // one-shot on it so resume refreshes never restore on top of it.
+        final hadPendingLink = ref.read(pendingDeepLinkProvider) != null;
         _maybeDispatch(ref.read(pendingDeepLinkProvider));
+        if (hadPendingLink) {
+          _lastConversationRestored = true;
+          return;
+        }
+        _maybeRestoreLastConversation();
       });
     }
 
     return widget.child;
+  }
+
+  /// On the first successful channels load of the process, reopen the
+  /// conversation the user was last in. A pending deep link always wins; a
+  /// stored id that no longer resolves to a channel is cleared and ignored.
+  /// The one-shot flag is spent only when the launch has been claimed — by the
+  /// deep link, or by a restore — so "identity not ready yet" keeps retrying.
+  void _maybeRestoreLastConversation() {
+    if (_lastConversationRestored || !mounted) return;
+    final channels = ref.read(channelsProvider).asData?.value;
+    if (channels == null) return;
+    if (ref.read(pendingDeepLinkProvider) != null) {
+      _lastConversationRestored = true;
+      return;
+    }
+    final pubkey = ref.read(readStateProvider).pubkey;
+    if (pubkey == null) {
+      _listenForIdentityPubkey();
+      return; // identity not ready yet — keep retrying
+    }
+    _lastConversationRestored = true;
+    final storage = ref.read(lastConversationStorageProvider);
+    final storedChannelId = storage.read(pubkey);
+    if (storedChannelId == null) return;
+
+    final channel = channels
+        .where((candidate) => candidate.id == storedChannelId)
+        .cast<Channel?>()
+        .firstOrNull;
+    if (channel == null) {
+      storage.clear(pubkey);
+      return;
+    }
+    final link = ChannelDeepLink(channelId: channel.id);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            widget.destinationBuilder?.call(channel, link) ??
+            ChannelDetailPage(channel: channel),
+      ),
+    );
+  }
+
+  /// Subscribe once to the identity pubkey so a later non-null value retries
+  /// the restore. Reading the pubkey state rises to identity initialization;
+  /// subscribing lazily avoids that cost on launches that never reach the
+  /// identity-ready retry.
+  void _listenForIdentityPubkey() {
+    if (_listeningIdentityPubkey) return;
+    _listeningIdentityPubkey = true;
+    ref.listenManual<String?>(
+      readStateProvider.select((state) => state.pubkey),
+      (_, _) => _maybeRestoreLastConversation(),
+    );
   }
 
   void _maybeDispatch(BuzzDeepLink? link) {
