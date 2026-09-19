@@ -29,11 +29,14 @@ void main() {
     required ChannelsNotifier channelsNotifier,
     PendingDeepLinkNotifier? pending,
     _RecordingDestinationBuilder? builder,
+    _InactiveReadStateNotifier? readState,
   }) async {
     final container = ProviderContainer(
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
-        readStateProvider.overrideWith(() => _InactiveReadStateNotifier(pubkey)),
+        readStateProvider.overrideWith(
+          () => readState ?? _InactiveReadStateNotifier(pubkey),
+        ),
         channelsProvider.overrideWith(() => channelsNotifier),
         if (pending != null)
           pendingDeepLinkProvider.overrideWith(() => pending),
@@ -146,6 +149,54 @@ void main() {
     expect(builder.pushed.map((c) => c.id), ['channel-1']);
     expect(find.byType(_CapturedDestination), findsOneWidget);
   });
+
+  testWidgets(
+    'identity ready after the first channels load still restores once',
+    (tester) async {
+      final builder = _RecordingDestinationBuilder();
+      final notifier = _EmittingChannelsNotifier(Future.value([_channel]));
+      final readState = _InactiveReadStateNotifier(null);
+      await pumpRestoreApp(
+        tester,
+        prefs: await prefs(storedChannelId: 'channel-1'),
+        channelsNotifier: notifier,
+        builder: builder,
+        readState: readState,
+      );
+
+      expect(builder.pushed, isEmpty, reason: 'identity not ready yet');
+
+      readState.reveal();
+      await tester.pumpAndSettle();
+
+      expect(builder.pushed.map((c) => c.id), ['channel-1']);
+      expect(find.text('opened:channel-1'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'a second channels emission after a pending deep link does not push again',
+    (tester) async {
+      final builder = _RecordingDestinationBuilder();
+      final notifier = _EmittingChannelsNotifier(Future.value([_channel]));
+      await pumpRestoreApp(
+        tester,
+        prefs: await prefs(storedChannelId: 'channel-1'),
+        channelsNotifier: notifier,
+        pending: _PendingDeepLinkNotifier(
+          const ChannelDeepLink(channelId: 'channel-1'),
+        ),
+        builder: builder,
+      );
+      expect(builder.pushed.map((c) => c.id), ['channel-1']);
+
+      notifier.emit([_channel, _secondChannel]);
+      await tester.pumpAndSettle();
+
+      expect(builder.pushed.map((c) => c.id), ['channel-1']);
+      expect(find.byType(_CapturedDestination), findsOneWidget);
+    },
+  );
 }
 
 final _secondChannel = Channel(
@@ -175,10 +226,17 @@ final _channel = Channel(
 class _InactiveReadStateNotifier extends ReadStateNotifier {
   _InactiveReadStateNotifier(this.pubkey);
 
-  final String pubkey;
+  String? pubkey;
 
   @override
-  ReadStateState build() => ReadStateState(
+  ReadStateState build() => _state();
+
+  void reveal() {
+    pubkey = 'aa';
+    state = _state();
+  }
+
+  ReadStateState _state() => ReadStateState(
     isReady: false,
     pubkey: pubkey,
     contexts: const {},
