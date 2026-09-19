@@ -4,13 +4,28 @@ import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:buzz/features/channels/channel_messages_provider.dart';
 import 'package:buzz/features/channels/pending_local_messages_provider.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/shared/relay/relay.dart';
+import 'package:buzz/shared/theme/theme_provider.dart' show savedPrefsProvider;
+
+/// Backs [_buildContainer]'s `savedPrefsProvider` override. The real
+/// notifier now persists a disk snapshot on every successful history load
+/// (see channel_message_cache_storage.dart), so every test exercising that
+/// path needs a concrete SharedPreferences instance rather than the provider's
+/// default `throw UnimplementedError`.
+late SharedPreferences _testPrefs;
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  setUp(() async {
+    SharedPreferences.setMockInitialValues({});
+    _testPrefs = await SharedPreferences.getInstance();
+  });
+
   test('live window without deep links does not rescan flattened ids', () async {
     var historyIdReads = 0;
     final history = _IdReadTrackingEvent(
@@ -1062,6 +1077,38 @@ void main() {
       ['older', 'head'],
     );
   });
+
+  test('does not cache to disk when no identity is resolved (no shared '
+      "'anon' bucket)", () async {
+    // myPubkeyProvider is left unoverridden here, matching a real app's
+    // provider graph before authentication resolves. A successful history
+    // load must not persist anything under a shared fallback key: that
+    // would let two different signed-out states, or a transient gap before
+    // the real pubkey resolves, read each other's cached messages.
+    final relaySession = _RecordingRelaySessionNotifier(
+      queryResults: [
+        [_event(id: 'history', createdAt: 10), _bounds()],
+      ],
+    );
+    final container = _buildContainer(relaySession);
+    addTearDown(container.dispose);
+
+    container.read(channelMessagesProvider(_channelId));
+    await relaySession.subscribed;
+    await _pumpEventQueue();
+
+    expect(
+      container.read(channelMessagesProvider(_channelId)).value?.length,
+      1,
+      reason: 'the load itself must still succeed normally',
+    );
+    expect(
+      _testPrefs.getKeys().where(
+        (key) => key.contains('channel-message-cache'),
+      ),
+      isEmpty,
+    );
+  });
 }
 
 const _channelId = '11111111-1111-4111-8111-111111111111';
@@ -1089,7 +1136,10 @@ class _IdReadTrackingEvent extends NostrEvent {
 
 ProviderContainer _buildContainer(_RecordingRelaySessionNotifier relaySession) {
   return ProviderContainer(
-    overrides: [relaySessionProvider.overrideWith(() => relaySession)],
+    overrides: [
+      relaySessionProvider.overrideWith(() => relaySession),
+      savedPrefsProvider.overrideWithValue(_testPrefs),
+    ],
   );
 }
 

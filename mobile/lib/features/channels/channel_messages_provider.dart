@@ -2,7 +2,9 @@ import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/relay/relay.dart';
+import '../../shared/theme/theme_provider.dart' show savedPrefsProvider;
 import 'channel_event_order.dart';
+import 'channel_message_cache/channel_message_cache_storage.dart';
 import 'pending_local_messages_provider.dart';
 import 'channel_window.dart';
 import 'thread_replies_provider.dart';
@@ -57,6 +59,12 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       _initInFlight = false;
       _initialWindowQueryInFlight = false;
       _liveSummaryRootsDuringInitialWindowQuery.clear();
+      // A cold launch has no in-memory `_lastKnownMessages` yet, but a prior
+      // session may have left a disk snapshot for this exact channel. Reading
+      // it here (SharedPreferences is preloaded before `runApp`, so this is
+      // synchronous) lets the first frame paint real content instead of the
+      // disconnected placeholder.
+      _lastKnownMessages ??= _readCachedSnapshot();
       return AsyncData(_lastKnownMessages ?? const []);
     }
 
@@ -115,6 +123,9 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       ]);
       _lastKnownMessages = merged;
       state = AsyncData(merged);
+      // Snapshot on a successful load only — not on every live event, which
+      // would turn a busy channel into a write on every message.
+      if (merged.isNotEmpty) _writeCachedSnapshot(merged);
     } catch (e, st) {
       if (!_isCurrentInit(initVersion)) return;
       final fallbackMessages = state.value ?? _lastKnownMessages;
@@ -389,6 +400,48 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     final updated = [...current, incoming];
     updated.sort(compareChannelTimelineEventsChronologically);
     return updated;
+  }
+
+  /// Reads this channel's cached newest-message snapshot from disk, scoped to
+  /// the active identity and relay so a switch between them can never surface
+  /// another identity's messages.
+  ///
+  /// Returns null (and touches no storage) when there is no resolved
+  /// identity yet. There is no shared "no identity" bucket to fall back to:
+  /// that would let two different signed-out states, or a transient gap
+  /// before the real pubkey resolves, share one identity's cache. A null
+  /// result here just means this build sees no cache; `_lastKnownMessages
+  /// ??= ...` retries on the next build once a real pubkey is available.
+  List<NostrEvent>? _readCachedSnapshot() {
+    final pubkey = ref.read(myPubkeyProvider);
+    if (pubkey == null || pubkey.isEmpty) return null;
+    final config = ref.read(relayConfigProvider);
+    final cached = ChannelMessageCacheStorage(ref.read(savedPrefsProvider))
+        .readChannel(
+          baseUrl: config.baseUrl,
+          storedOrigin: config.storedOrigin,
+          pubkey: pubkey,
+          channelId: channelId,
+        );
+    return cached == null || cached.isEmpty ? null : cached;
+  }
+
+  /// Persists [messages] as this channel's newest-message snapshot, scoped to
+  /// the active identity and relay. Caller-side LRU across channels (entry
+  /// count and serialized bytes) is handled by [ChannelMessageCacheStorage].
+  ///
+  /// A no-op when there is no resolved identity — see [_readCachedSnapshot].
+  void _writeCachedSnapshot(List<NostrEvent> messages) {
+    final pubkey = ref.read(myPubkeyProvider);
+    if (pubkey == null || pubkey.isEmpty) return;
+    final config = ref.read(relayConfigProvider);
+    ChannelMessageCacheStorage(ref.read(savedPrefsProvider)).writeChannel(
+      baseUrl: config.baseUrl,
+      storedOrigin: config.storedOrigin,
+      pubkey: pubkey,
+      channelId: channelId,
+      messages: messages,
+    );
   }
 
   bool _isCurrentInit(int initVersion) => initVersion == _initVersion;
