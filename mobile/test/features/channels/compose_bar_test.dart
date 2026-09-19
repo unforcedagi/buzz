@@ -4099,6 +4099,67 @@ void main() {
       expect(find.byTooltip('Remove attachment'), findsOneWidget);
     });
 
+    testWidgets(
+      'shows the offline message, not a raw exception, when an attachment '
+      'send is rejected because the relay is disconnected',
+      (tester) async {
+        // The upload itself succeeds; it's the delivery of the signed event
+        // that fails because the relay session is down. Before the fix this
+        // surfaced `_formatUploadError`'s raw
+        // "RelayDisconnectedException: Relay session is not connected"
+        // instead of the same offline copy the text-only send path shows.
+        final uploadService = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: nostr.Keys.generate().nsec,
+          httpClient: http_testing.MockClient((request) async {
+            return http.Response(
+              jsonEncode({
+                'url': 'https://relay.example/media/test.png',
+                'sha256':
+                    '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                'size': 16,
+                'type': 'image/png',
+                'uploaded': 1,
+              }),
+              200,
+            );
+          }),
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async =>
+              XFile.fromData(_pngBytes, name: 'tiny.png'),
+        );
+
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: uploadService,
+            onSend:
+                (
+                  content,
+                  mentionPubkeys, {
+                  mediaTags = const <List<String>>[],
+                }) => throw const RelayDisconnectedException(),
+          ),
+        );
+
+        await _openSystemPhotoPicker(tester);
+        await tester.pumpAndSettle();
+        await _expandComposer(tester);
+        await tester.enterText(find.byType(TextField), 'Keep this draft');
+        await tester.tap(find.byIcon(LucideIcons.arrowUp));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.text(
+            "Message not sent: you're offline. Your draft was restored.",
+          ),
+          findsOneWidget,
+        );
+        expect(find.textContaining('RelayDisconnectedException'), findsNothing);
+        expect(find.text('Keep this draft'), findsOneWidget);
+        expect(find.byTooltip('Remove attachment'), findsOneWidget);
+      },
+    );
+
     for (final statusCode in [
       HttpStatus.unsupportedMediaType,
       HttpStatus.unprocessableEntity,

@@ -675,11 +675,16 @@ class _MessageList extends HookConsumerWidget {
 
     // A disconnected session cannot tell an empty channel from one whose
     // history simply hasn't loaded — asserting "No messages yet" here would
-    // be a guess, not a fact. Say the true thing instead.
+    // be a guess, not a fact. Say the true thing instead. But a channel that
+    // *has* completed a load (`hasLoadedMessages`) and came back empty is a
+    // fact we already know, disconnected or not — showing "Can't reach Buzz"
+    // for it would just be a different false statement.
     final sessionStatus = ref.watch(
       relaySessionProvider.select((state) => state.status),
     );
-    if (entries.isEmpty && sessionStatus == SessionStatus.disconnected) {
+    if (entries.isEmpty &&
+        sessionStatus == SessionStatus.disconnected &&
+        !notifier.hasLoadedMessages) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,

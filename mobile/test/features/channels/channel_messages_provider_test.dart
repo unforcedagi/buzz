@@ -1078,6 +1078,65 @@ void main() {
     );
   });
 
+  test('does not leak in-memory messages across an identity switch on the '
+      'same notifier', () async {
+    // `channelMessagesProvider` is a `NotifierProvider.family` keyed only
+    // by channelId, and it is not autoDispose — the same notifier
+    // instance survives an identity switch (same-relay identities share
+    // NIP-29 channel ids). Drive that switch on one ProviderContainer,
+    // never rebuilding the notifier from scratch, so this actually
+    // exercises the leak: identity A loads real messages, the relay then
+    // drops, identity switches to B (no disk cache for this channel), and
+    // none of A's messages may still be showing under B.
+    final relaySession = _RecordingRelaySessionNotifier(
+      queryResults: [
+        [_event(id: 'a-secret', createdAt: 10), _bounds()],
+      ],
+    );
+    final container = ProviderContainer(
+      overrides: [
+        relaySessionProvider.overrideWith(() => relaySession),
+        savedPrefsProvider.overrideWithValue(_testPrefs),
+        myPubkeyProvider.overrideWithValue('pk-a'),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    container.read(channelMessagesProvider(_channelId));
+    await relaySession.subscribed;
+    await _pumpEventQueue();
+    expect(
+      container
+          .read(channelMessagesProvider(_channelId))
+          .value
+          ?.map((event) => event.id),
+      ['a-secret'],
+      reason: "identity A's load must succeed normally",
+    );
+
+    // The relay drops, then identity switches to B while disconnected —
+    // the exact repro from the review: open channel X as A (loads),
+    // switch to B, open channel X as B while disconnected.
+    relaySession.setConnected(false);
+    container.updateOverrides([
+      relaySessionProvider.overrideWith(() => relaySession),
+      savedPrefsProvider.overrideWithValue(_testPrefs),
+      myPubkeyProvider.overrideWithValue('pk-b'),
+    ]);
+    await _pumpEventQueue();
+
+    final messagesForB = container
+        .read(channelMessagesProvider(_channelId))
+        .value;
+    expect(
+      messagesForB?.map((event) => event.id) ?? const <String>[],
+      isNot(contains('a-secret')),
+      reason:
+          "identity B has no disk cache for this channel, so identity "
+          "A's in-memory messages must not paint under B",
+    );
+  });
+
   test('does not cache to disk when no identity is resolved (no shared '
       "'anon' bucket)", () async {
     // myPubkeyProvider is left unoverridden here, matching a real app's

@@ -422,6 +422,14 @@ void _reportSendCancelledByCommunitySwitch(ScaffoldMessengerState? messenger) {
   );
 }
 
+/// User-facing copy for a send cancelled by a disconnected relay. Shared by
+/// the text-only send path (as a snackbar, via
+/// [_reportSendCancelledByDisconnection]) and the attachment upload path
+/// (inline, via `uploadError`) so both say the same true thing instead of
+/// the attachment path leaking a raw `RelayDisconnectedException.toString()`.
+const _offlineSendErrorMessage =
+    "Message not sent: you're offline. Your draft was restored.";
+
 /// Reports a send that failed because the relay socket is down.
 ///
 /// The draft has already been restored to the composer by the time this
@@ -429,11 +437,7 @@ void _reportSendCancelledByCommunitySwitch(ScaffoldMessengerState? messenger) {
 /// whether their text is gone.
 void _reportSendCancelledByDisconnection(ScaffoldMessengerState? messenger) {
   messenger?.showSnackBar(
-    const SnackBar(
-      content: Text(
-        "Message not sent: you're offline. Your draft was restored.",
-      ),
-    ),
+    const SnackBar(content: Text(_offlineSendErrorMessage)),
   );
 }
 

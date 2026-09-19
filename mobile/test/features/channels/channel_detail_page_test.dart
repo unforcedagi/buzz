@@ -3074,14 +3074,22 @@ void main() {
     });
 
     testWidgets(
-      'shows an offline state instead of empty state when disconnected',
+      'shows an offline state instead of empty state when disconnected '
+      'before any load',
       (tester) async {
-        // No messages loaded and the relay session is disconnected: the app
-        // cannot tell an empty channel from one it simply can't reach yet,
-        // so it must not claim "No messages yet".
+        // No history has ever loaded and the relay session is disconnected:
+        // the app cannot tell an empty channel from one it simply can't
+        // reach yet, so it must not claim "No messages yet". Pin
+        // hasLoadedMessages: false explicitly — this is the never-loaded
+        // case the offline copy is meant for, as opposed to a genuinely
+        // loaded-empty channel (see the test below).
         await tester.pumpWidget(
           _buildTestable(
             messages: [],
+            messagesNotifier: _FakeMessagesNotifier(
+              const [],
+              hasLoadedMessages: false,
+            ),
             relaySessionNotifier: _TrackingRelaySession(),
           ),
         );
@@ -3093,6 +3101,36 @@ void main() {
         expect(
           find.text("Messages will show up once you're back online."),
           findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'keeps "No messages yet" for a genuinely loaded-empty channel after '
+      'a disconnect',
+      (tester) async {
+        // The channel completed a real history load and came back empty —
+        // that is a known fact, not a guess. A later disconnect must not
+        // replace it with the synthetic "Can't reach Buzz" copy, which
+        // would just be a different false statement.
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [],
+            messagesNotifier: _FakeMessagesNotifier(
+              const [],
+              hasLoadedMessages: true,
+            ),
+            relaySessionNotifier: _TrackingRelaySession(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('No messages yet'), findsOneWidget);
+        expect(find.text('Be the first to say something!'), findsOneWidget);
+        expect(find.text("Can't reach Buzz"), findsNothing);
+        expect(
+          find.text("Messages will show up once you're back online."),
+          findsNothing,
         );
       },
     );
@@ -3152,6 +3190,14 @@ void main() {
         },
       );
 
+      // This test builds a *fresh* ProviderScope per identity, so it only
+      // proves the two disk cache keys differ — it never switches an
+      // existing notifier's identity, so it cannot catch the in-memory
+      // `_lastKnownMessages ??= ...` leak across a live identity switch.
+      // See `does not leak in-memory messages across an identity switch on
+      // the same notifier` in channel_messages_provider_test.dart for that
+      // seam, driven directly against the real ChannelMessagesNotifier on a
+      // single ProviderContainer.
       testWidgets('does not leak a cached snapshot across an identity switch', (
         tester,
       ) async {
