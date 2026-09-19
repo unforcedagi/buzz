@@ -5,6 +5,8 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/deeplink/deep_link.dart';
 import '../../shared/deeplink/pending_deep_link_provider.dart';
+import '../../shared/last_conversation/last_conversation_storage.dart';
+import '../../shared/read_state/read_state_provider.dart';
 import '../invites/invite_join_provider.dart';
 import '../invites/invite_join_sheet.dart';
 import 'channel.dart';
@@ -39,6 +41,7 @@ class DeepLinkDispatcher extends ConsumerStatefulWidget {
 
 class _DeepLinkDispatcherState extends ConsumerState<DeepLinkDispatcher> {
   bool _preparingInvite = false;
+  bool _lastConversationRestored = false;
 
   @override
   void initState() {
@@ -46,6 +49,7 @@ class _DeepLinkDispatcherState extends ConsumerState<DeepLinkDispatcher> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _maybeDispatch(ref.read(pendingDeepLinkProvider));
+      _maybeRestoreLastConversation();
     });
   }
 
@@ -57,11 +61,51 @@ class _DeepLinkDispatcherState extends ConsumerState<DeepLinkDispatcher> {
     });
     if (widget.dispatchMessageLinks) {
       ref.listen<AsyncValue<List<Channel>>>(channelsProvider, (_, _) {
+        // Dispatch runs first and may consume a pending link synchronously;
+        // restore is skipped whenever a link was pending on this pass so the
+        // deep link's push stays the only navigation.
+        final hadPendingLink = ref.read(pendingDeepLinkProvider) != null;
         _maybeDispatch(ref.read(pendingDeepLinkProvider));
+        if (hadPendingLink) return;
+        _maybeRestoreLastConversation();
       });
     }
 
     return widget.child;
+  }
+
+  /// On the first successful channels load of the process, reopen the
+  /// conversation the user was last in. A pending deep link always wins; a
+  /// stored id that no longer resolves to a channel is cleared and ignored.
+  void _maybeRestoreLastConversation() {
+    if (_lastConversationRestored || !mounted) return;
+    if (ref.read(pendingDeepLinkProvider) != null) return;
+    final channels = ref.read(channelsProvider).asData?.value;
+    if (channels == null) return;
+    _lastConversationRestored = true;
+
+    final pubkey = ref.read(readStateProvider).pubkey;
+    if (pubkey == null) return;
+    final storage = ref.read(lastConversationStorageProvider);
+    final storedChannelId = storage.read(pubkey);
+    if (storedChannelId == null) return;
+
+    final channel = channels
+        .where((candidate) => candidate.id == storedChannelId)
+        .cast<Channel?>()
+        .firstOrNull;
+    if (channel == null) {
+      storage.clear(pubkey);
+      return;
+    }
+    final link = ChannelDeepLink(channelId: channel.id);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            widget.destinationBuilder?.call(channel, link) ??
+            ChannelDetailPage(channel: channel),
+      ),
+    );
   }
 
   void _maybeDispatch(BuzzDeepLink? link) {
