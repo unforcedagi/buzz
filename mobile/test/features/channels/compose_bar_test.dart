@@ -3101,6 +3101,70 @@ void main() {
       },
     );
 
+    testWidgets(
+      'reports being offline, not a community switch, when the relay is '
+      'disconnected',
+      (tester) async {
+        final signer = nostr.Keys.generate();
+        // A real session with no socket attached, so the send goes through
+        // the actual publish() rejection rather than a stand-in for it.
+        final relaySession = RelaySessionNotifier();
+        final removedLocalMessageIds = <String>[];
+        final sendMessage = SendMessage(
+          signedEventRelay: SignedEventRelay(
+            session: relaySession,
+            nsec: signer.nsec,
+          ),
+          fetchMembers: (_) async => const [],
+          readUserCache: () => const {},
+          addLocalMessage: (_, _) {},
+          removeLocalMessage: (_, eventId) =>
+              removedLocalMessageIds.add(eventId),
+          completeLocalMessage: (_, _) {},
+        );
+
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: _testUploadService(signer.nsec),
+            currentPubkey: signer.public,
+            onSend: (content, pubkeys, {mediaTags = const <List<String>>[]}) =>
+                sendMessage(
+                  channelId: 'channel-1',
+                  content: content,
+                  mentionPubkeys: pubkeys,
+                  mediaTags: mediaTags,
+                ),
+          ),
+        );
+
+        await _expandComposer(tester);
+        await tester.enterText(find.byType(TextField), 'hello offline');
+        await tester.pumpAndSettle();
+        await tester.tap(find.byIcon(LucideIcons.arrowUp));
+        await tester.pumpAndSettle();
+
+        // Rolled back locally: the send genuinely never reached the relay.
+        expect(removedLocalMessageIds, hasLength(1));
+        expect(
+          find.widgetWithText(
+            SnackBar,
+            'Message not sent: the community changed',
+          ),
+          findsNothing,
+        );
+        expect(
+          find.widgetWithText(
+            SnackBar,
+            "Message not sent: you're offline. Your draft was restored.",
+          ),
+          findsOneWidget,
+        );
+        // The draft text is genuinely restored to the composer, not just
+        // claimed to be.
+        expect(find.text('hello offline'), findsOneWidget);
+      },
+    );
+
     testWidgets('surfaces an error and keeps the draft when a community switch '
         'cancels a text-only send', (tester) async {
       final agentPubkey = 'c' * 64;

@@ -1632,7 +1632,7 @@ void main() {
       session.debugSupersedeConnection();
       gateTimers.single.fire();
 
-      await expectLater(publish, throwsA(isA<StateError>()));
+      await expectLater(publish, throwsA(isA<RelayDisconnectedException>()));
       expect(socket.messages, isEmpty);
     },
   );

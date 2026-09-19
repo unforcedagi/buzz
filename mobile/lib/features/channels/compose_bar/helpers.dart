@@ -422,6 +422,21 @@ void _reportSendCancelledByCommunitySwitch(ScaffoldMessengerState? messenger) {
   );
 }
 
+/// Reports a send that failed because the relay socket is down.
+///
+/// The draft has already been restored to the composer by the time this
+/// runs, so the message says so rather than leaving the user to wonder
+/// whether their text is gone.
+void _reportSendCancelledByDisconnection(ScaffoldMessengerState? messenger) {
+  messenger?.showSnackBar(
+    const SnackBar(
+      content: Text(
+        "Message not sent: you're offline. Your draft was restored.",
+      ),
+    ),
+  );
+}
+
 /// What an add attempt left undone: who is still a non-member, and why.
 @immutable
 class _NonMemberAddOutcome {

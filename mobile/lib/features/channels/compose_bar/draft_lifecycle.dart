@@ -49,6 +49,9 @@ Future<void> _sendTextOnlyDraft({
       outgoing.pubkeys,
       mediaTags: [...payload.mediaTags, ...outgoing.referenceTags],
     );
+  } on RelayDisconnectedException {
+    restoreClearedDraft();
+    _reportSendCancelledByDisconnection(messenger);
   } on StateError {
     restoreClearedDraft();
     _reportSendCancelledByCommunitySwitch(messenger);

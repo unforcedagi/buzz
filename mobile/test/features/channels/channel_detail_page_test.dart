@@ -3048,12 +3048,44 @@ void main() {
     });
 
     testWidgets('shows empty state when no messages', (tester) async {
-      await tester.pumpWidget(_buildTestable(messages: []));
+      // Pin the session connected: a real empty channel, not a dropout,
+      // must still say "No messages yet". See the disconnected case below.
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          relaySessionNotifier: _ConnectedRelaySession(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('No messages yet'), findsOneWidget);
       expect(find.text('Be the first to say something!'), findsOneWidget);
+      expect(find.text("Can't reach Buzz"), findsNothing);
     });
+
+    testWidgets(
+      'shows an offline state instead of empty state when disconnected',
+      (tester) async {
+        // No messages loaded and the relay session is disconnected: the app
+        // cannot tell an empty channel from one it simply can't reach yet,
+        // so it must not claim "No messages yet".
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [],
+            relaySessionNotifier: _TrackingRelaySession(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('No messages yet'), findsNothing);
+        expect(find.text('Be the first to say something!'), findsNothing);
+        expect(find.text("Can't reach Buzz"), findsOneWidget);
+        expect(
+          find.text("Messages will show up once you're back online."),
+          findsOneWidget,
+        );
+      },
+    );
 
     testWidgets('renders text messages with author and content', (
       tester,
@@ -14419,6 +14451,17 @@ class _TrackingRelaySession extends RelaySessionNotifier {
       release();
     };
   }
+}
+
+class _ConnectedRelaySession extends RelaySessionNotifier {
+  @override
+  SessionState build() => const SessionState(status: SessionStatus.connected);
+
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async => [];
 }
 
 class _ReconnectingRelaySession extends RelaySessionNotifier {

@@ -73,6 +73,33 @@ void main() {
     expect(removedIds, [localMessages.single.id]);
   });
 
+  test('surfaces a disconnected relay as RelayDisconnectedException, not a '
+      'bare StateError', () async {
+    // A real session with no socket attached — publish() must reject with
+    // the typed disconnection error so callers (e.g. the compose bar) can
+    // tell "you're offline" apart from an unrelated StateError, such as a
+    // community switch, without matching on message text.
+    final session = RelaySessionNotifier();
+    final removedIds = <String>[];
+    final send = SendMessage(
+      signedEventRelay: SignedEventRelay(
+        session: session,
+        nsec: nostr.Keys.generate().nsec,
+      ),
+      fetchMembers: (_) async => const [],
+      readUserCache: () => const {},
+      addLocalMessage: (_, _) {},
+      completeLocalMessage: (_, _) {},
+      removeLocalMessage: (_, eventId) => removedIds.add(eventId),
+    );
+
+    await expectLater(
+      send(channelId: _channelId, content: 'hello'),
+      throwsA(isA<RelayDisconnectedException>()),
+    );
+    expect(removedIds, hasLength(1));
+  });
+
   test('final signed event addresses the current DM agent member', () async {
     final session = _PendingPublishRelaySession();
     final signingKey = nostr.Keys.generate().nsec;
