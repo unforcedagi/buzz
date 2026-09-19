@@ -29,11 +29,63 @@ pub(super) fn app_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// The only webview label allowed to drive app-surface commands. Split out of
+/// [`main_only`] so the policy can be asserted without constructing a Webview:
+/// a connected app runs under a `connected-app-<session>` label and must never
+/// reach these commands, least of all the sign-in ceremony, which signs with
+/// the user's own key.
+pub(super) fn is_main_label(label: &str) -> bool {
+    label == "main"
+}
+
 fn main_only(view: &Webview) -> Result<(), String> {
-    if view.label() != "main" {
+    if !is_main_label(view.label()) {
         return Err("Only the main client can manage app surfaces".into());
     }
     Ok(())
+}
+
+/// The two cookies the hub is allowed to hand back from a sign-in, vetted and
+/// prepared for the webview cookie store.
+///
+/// Split out of the sign-in command so the policy is testable headlessly. Three
+/// things matter and are asserted in the tests below:
+///
+///   1. Only `parachute_hub_session` (the session) and
+///      `parachute_hub_pending_login` (the 2FA hop) are accepted, and only when
+///      the hub marked them `HttpOnly`. Anything else is refused outright
+///      rather than injected.
+///   2. **Every other attribute the hub chose is preserved** —
+///      `parachute_hub_pending_login` is deliberately `Path=/login` on the hub
+///      side so it rides only the login endpoints, and `Cookie::build(base)`
+///      keeps that, along with `SameSite` and `Max-Age`. Do not normalise them.
+///   3. `domain` is set to the app's own host. This is NOT optional: wry's
+///      macOS path builds an `NSHTTPCookie` from `NSHTTPCookieDomain`, and a
+///      cookie with no domain reaches WebKit with an empty string for it. The
+///      hub sends a host-only cookie (no `Domain` attribute), so naming the
+///      host here is what makes it storable at all. The RFC-6265 consequence —
+///      a `Domain` attribute also matches subdomains — is a limitation of that
+///      platform API, not a choice; it is asserted below so a future change to
+///      a parent domain fails loudly.
+pub(super) fn vet_hub_cookie(
+    raw: &str,
+    host: &str,
+    secure: bool,
+) -> Result<tauri::webview::Cookie<'static>, String> {
+    let cookie = tauri::webview::Cookie::parse(raw.to_string())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    if !matches!(
+        cookie.name(),
+        "parachute_hub_session" | "parachute_hub_pending_login"
+    ) || cookie.http_only() != Some(true)
+    {
+        return Err("Unexpected hub session cookie".into());
+    }
+    Ok(tauri::webview::Cookie::build(cookie)
+        .domain(host.to_string())
+        .secure(secure)
+        .build())
 }
 
 #[derive(Deserialize)]
@@ -255,20 +307,7 @@ pub async fn connected_parachute_sign_in(
         .ok_or("Missing host")?
         .to_string();
     for raw in cookies {
-        let cookie = tauri::webview::Cookie::parse(raw)
-            .map_err(|e| e.to_string())?
-            .into_owned();
-        if !matches!(
-            cookie.name(),
-            "parachute_hub_session" | "parachute_hub_pending_login"
-        ) || cookie.http_only() != Some(true)
-        {
-            return Err("Unexpected hub session cookie".into());
-        }
-        let cookie = tauri::webview::Cookie::build(cookie)
-            .domain(host.clone())
-            .secure(origin.starts_with("https:"))
-            .build();
+        let cookie = vet_hub_cookie(&raw, &host, origin.starts_with("https:"))?;
         view.set_cookie(cookie).map_err(|e| e.to_string())?;
     }
     let destination = if result["requires_2fa"] == true {
@@ -301,6 +340,108 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- containment: who may drive an app surface -----------------------
+    //
+    // A connected app's webview is labelled `connected-app-<session>`. Only
+    // the main client may call these commands; the sign-in ceremony in
+    // particular signs an event with the user's own key, so a remote page
+    // reaching it would be the whole game.
+    #[test]
+    fn only_the_main_webview_label_may_drive_app_surfaces() {
+        assert!(is_main_label("main"));
+        for label in [
+            "connected-app-0f0e0d0c-0b0a-0908-0706-050403020100",
+            "Main",
+            "main ",
+            "",
+            "connected-app-main",
+        ] {
+            assert!(!is_main_label(label), "label {label:?} must not count as main");
+        }
+    }
+
+    // ---- containment: which cookies may be injected ----------------------
+    #[test]
+    fn refuses_cookies_outside_the_two_hub_names() {
+        for raw in [
+            "session=abc; HttpOnly; Path=/",
+            "parachute_hub_sessionx=abc; HttpOnly; Path=/",
+            "csrf=abc; HttpOnly; Path=/",
+        ] {
+            assert!(
+                vet_hub_cookie(raw, "hub.example", true).is_err(),
+                "cookie {raw:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_cookie_the_hub_did_not_mark_http_only() {
+        // Readable by scripts in the webview is exactly what must not happen.
+        assert!(vet_hub_cookie("parachute_hub_session=abc; Path=/", "hub.example", true).is_err());
+        assert!(
+            vet_hub_cookie("parachute_hub_session=abc; Path=/; HttpOnly", "hub.example", true)
+                .is_ok()
+        );
+    }
+
+    // ---- contract: the hub's own attributes survive the rebuild ----------
+    //
+    // `parachute_hub_pending_login` is Path=/login on the hub side ON PURPOSE,
+    // so the 2FA hop cookie rides only the login endpoints. Normalising it to
+    // "/" would widen it across the whole origin. This test exists because that
+    // normalisation was *suspected* and is in fact not happening: it pins the
+    // behaviour so a future refactor cannot introduce it silently.
+    #[test]
+    fn preserves_the_hubs_path_same_site_and_max_age() {
+        let pending = vet_hub_cookie(
+            "parachute_hub_pending_login=t; HttpOnly; SameSite=Lax; Path=/login; Max-Age=600",
+            "hub.example",
+            true,
+        )
+        .expect("pending cookie accepted");
+        assert_eq!(pending.path(), Some("/login"));
+        assert_eq!(pending.max_age().map(|d| d.whole_seconds()), Some(600));
+        assert_eq!(pending.same_site(), Some(tauri::webview::cookie::SameSite::Lax));
+
+        let session = vet_hub_cookie(
+            "parachute_hub_session=s; HttpOnly; SameSite=Lax; Path=/; Max-Age=7776000",
+            "hub.example",
+            true,
+        )
+        .expect("session cookie accepted");
+        assert_eq!(session.path(), Some("/"));
+        assert_eq!(session.max_age().map(|d| d.whole_seconds()), Some(7776000));
+    }
+
+    // The domain must be the app's own host and nothing broader. wry's macOS
+    // path needs a non-empty NSHTTPCookieDomain, so this attribute is required
+    // for the cookie to be stored at all; the test's job is to make sure it is
+    // never widened to a parent domain.
+    #[test]
+    fn scopes_the_cookie_to_the_apps_own_host() {
+        let cookie = vet_hub_cookie(
+            "parachute_hub_session=s; HttpOnly; Path=/",
+            "uni.hub.example",
+            true,
+        )
+        .expect("accepted");
+        assert_eq!(cookie.domain(), Some("uni.hub.example"));
+        assert_ne!(cookie.domain(), Some("hub.example"));
+    }
+
+    #[test]
+    fn secure_follows_the_origin_scheme() {
+        let https = vet_hub_cookie("parachute_hub_session=s; HttpOnly; Path=/", "h.example", true)
+            .expect("accepted");
+        assert_eq!(https.secure(), Some(true));
+        let http = vet_hub_cookie("parachute_hub_session=s; HttpOnly; Path=/", "h.example", false)
+            .expect("accepted");
+        // Marking Secure over plain loopback HTTP would make WebKit drop it.
+        assert_eq!(http.secure(), Some(false));
+    }
+
     #[test]
     fn refuses_privileged_schemes_and_embedded_credentials() {
         for url in [
