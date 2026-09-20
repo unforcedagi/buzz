@@ -1132,7 +1132,7 @@ void main() {
       messagesForB?.map((event) => event.id) ?? const <String>[],
       isNot(contains('a-secret')),
       reason:
-          "identity B has no disk cache for this channel, so identity "
+          'identity B has no disk cache for this channel, so identity '
           "A's in-memory messages must not paint under B",
     );
   });
