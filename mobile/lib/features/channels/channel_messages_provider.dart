@@ -42,10 +42,18 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   /// UI can show stale data instead of a blank loading spinner.
   List<NostrEvent>? _lastKnownMessages;
 
-  /// Whether this channel has completed at least one message history load.
+  /// Whether this channel has a last-known truth to show — not whether a
+  /// network load happened.
   ///
-  /// This distinguishes a genuinely loaded empty channel from the synthetic
-  /// empty value returned while the relay is not yet connected.
+  /// This distinguishes a channel we know about from the synthetic empty
+  /// value returned while the relay is not yet connected. A disk snapshot
+  /// sets it too, which is why it is phrased as last-known rather than
+  /// loaded: `_readCachedSnapshot` returns null for an empty snapshot and
+  /// writes skip empty lists, so `hasLoadedMessages && messages.isEmpty`
+  /// still means a network load came back empty. That invariant lives in
+  /// those two places, not here — if either changes, this getter's meaning
+  /// changes with it and the empty-state branch in `_MessageList` will need
+  /// splitting.
   bool get hasLoadedMessages => _lastKnownMessages != null;
 
   Map<String, ChannelWindowThreadSummary> get threadSummaries =>
@@ -113,11 +121,14 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   /// - `_windowStore`, `_usingChannelWindow`, `_reachedOldest`,
   ///   `_initialWindowQueryInFlight`,
   ///   `_liveSummaryRootsDuringInitialWindowQuery`: server-assembled window
-  ///   state for this channel on the *old* relay/identity. It is already
-  ///   fully reset by the `connected` branch below on every build, but the
-  ///   `disconnected` branch never touches it — without this, a disconnected
-  ///   switch would leave stale window pages sitting behind the cleared
-  ///   `_lastKnownMessages` for the next reconnect to merge against.
+  ///   state for this channel on the *old* relay/identity. The `connected`
+  ///   branch below already zeros it on every build, so the reconnect path
+  ///   is not the reason to clear it here. The reasons are that
+  ///   `threadSummaries` is read straight off `_windowStore` on every
+  ///   `ChannelDetailPage` build — including while the new identity is still
+  ///   disconnected, which would show the old identity's reply counts — and
+  ///   that an in-flight writer can land after that zeroing (see the
+  ///   `_isCurrentInit` fences in `_fetchNewestHistory` and `fetchOlder`).
   /// - `_deepLinkEvents` / `_retainedDeepLinkEventIds`: pinned events fetched
   ///   for a deep link belong to whichever relay/identity fetched them.
   /// - Subscription (`_clearSubscription`) and `_initInFlight`: an in-flight
