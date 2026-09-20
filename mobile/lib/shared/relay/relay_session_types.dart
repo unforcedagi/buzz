@@ -23,3 +23,17 @@ class SessionState {
 
 /// Recovery lifecycle for a live relay subscription.
 enum RelaySubscriptionStatus { ready, retrying }
+
+/// Thrown when an operation needs a live relay socket and the session is
+/// disconnected or has moved on to a newer connection generation.
+///
+/// Kept distinct from a bare [StateError] so callers can tell "you're
+/// offline" apart from other `StateError`s (e.g. a community switch
+/// cancelling an in-flight action) without matching on message text.
+class RelayDisconnectedException implements Exception {
+  const RelayDisconnectedException();
+
+  @override
+  String toString() =>
+      'RelayDisconnectedException: Relay session is not connected';
+}

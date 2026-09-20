@@ -18,6 +18,7 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channel_detail_page.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
+import 'package:buzz/features/channels/channel_message_cache/channel_message_cache_storage.dart';
 import 'package:buzz/features/channels/channel_messages_provider.dart';
 import 'package:buzz/features/channels/channel_mutes/channel_mutes_provider.dart';
 import 'package:buzz/features/channels/channel_mutes/channel_mutes_storage.dart';
@@ -239,6 +240,12 @@ Widget _buildTestable({
   Duration? Function(int retryCount, Object error)? providerRetry,
   RelaySessionNotifier? relaySessionNotifier,
   RelayConfigNotifier? relayConfigNotifier,
+  // Lets step-2 disk-cache tests exercise the real ChannelMessagesNotifier
+  // (and thus channel_message_cache_storage.dart) instead of the fake used
+  // by every other test in this file.
+  bool overrideChannelMessagesProvider = true,
+  SharedPreferences? prefsOverride,
+  String? myPubkeyOverride,
   HuddleMediaFactory? huddleMediaFactory,
   HuddleTransportFactory? huddleTransportFactory,
   HuddleHumanCountLoader? huddleHumanCountLoader,
@@ -256,9 +263,10 @@ Widget _buildTestable({
   return ProviderScope(
     retry: providerRetry ?? (disableRetries ? (_, _) => null : null),
     overrides: [
-      channelMessagesProvider(
-        _channelId,
-      ).overrideWith(() => fakeMessagesNotifier),
+      if (overrideChannelMessagesProvider)
+        channelMessagesProvider(
+          _channelId,
+        ).overrideWith(() => fakeMessagesNotifier),
       channelTypingProvider(
         _channelId,
       ).overrideWith(() => typingNotifier ?? _FakeTypingNotifier(typing)),
@@ -372,7 +380,9 @@ Widget _buildTestable({
         currentPubkeyProvider.overrideWith((ref) => huddleCurrentPubkey),
       appLifecycleProvider.overrideWith(_TestAppLifecycleNotifier.new),
       // Compose bar drafts persist through SharedPreferences.
-      savedPrefsProvider.overrideWithValue(_testPrefs),
+      savedPrefsProvider.overrideWithValue(prefsOverride ?? _testPrefs),
+      if (myPubkeyOverride != null)
+        myPubkeyProvider.overrideWithValue(myPubkeyOverride),
     ],
     child: MaterialApp(
       navigatorKey: navigatorKey,
@@ -3048,11 +3058,203 @@ void main() {
     });
 
     testWidgets('shows empty state when no messages', (tester) async {
-      await tester.pumpWidget(_buildTestable(messages: []));
+      // Pin the session connected: a real empty channel, not a dropout,
+      // must still say "No messages yet". See the disconnected case below.
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          relaySessionNotifier: _ConnectedRelaySession(),
+        ),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('No messages yet'), findsOneWidget);
       expect(find.text('Be the first to say something!'), findsOneWidget);
+      expect(find.text("Can't reach Buzz"), findsNothing);
+    });
+
+    testWidgets(
+      'shows an offline state instead of empty state when disconnected '
+      'before any load',
+      (tester) async {
+        // No history has ever loaded and the relay session is disconnected:
+        // the app cannot tell an empty channel from one it simply can't
+        // reach yet, so it must not claim "No messages yet". Pin
+        // hasLoadedMessages: false explicitly — this is the never-loaded
+        // case the offline copy is meant for, as opposed to a genuinely
+        // loaded-empty channel (see the test below).
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [],
+            messagesNotifier: _FakeMessagesNotifier(
+              const [],
+              hasLoadedMessages: false,
+            ),
+            relaySessionNotifier: _TrackingRelaySession(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('No messages yet'), findsNothing);
+        expect(find.text('Be the first to say something!'), findsNothing);
+        expect(find.text("Can't reach Buzz"), findsOneWidget);
+        expect(
+          find.text("Messages will show up once you're back online."),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets(
+      'keeps "No messages yet" for a genuinely loaded-empty channel after '
+      'a disconnect',
+      (tester) async {
+        // The channel completed a real history load and came back empty —
+        // that is a known fact, not a guess. A later disconnect must not
+        // replace it with the synthetic "Can't reach Buzz" copy, which
+        // would just be a different false statement.
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [],
+            messagesNotifier: _FakeMessagesNotifier(
+              const [],
+              hasLoadedMessages: true,
+            ),
+            relaySessionNotifier: _TrackingRelaySession(),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(find.text('No messages yet'), findsOneWidget);
+        expect(find.text('Be the first to say something!'), findsOneWidget);
+        expect(find.text("Can't reach Buzz"), findsNothing);
+        expect(
+          find.text("Messages will show up once you're back online."),
+          findsNothing,
+        );
+      },
+    );
+
+    group('disk-backed message cache (step 2 of the offline-truth spec)', () {
+      // These tests exercise the *real* ChannelMessagesNotifier (not the
+      // `_FakeMessagesNotifier` used by the rest of this file) so the disk
+      // read/write path in channel_message_cache_storage.dart is genuinely
+      // covered end to end through ChannelDetailPage. The session is pinned
+      // disconnected via `_TrackingRelaySession`, which never calls
+      // subscribe/queryRelay/fetchHistory, so no relay mocking is needed for
+      // the disconnected-path tests below.
+
+      testWidgets(
+        'paints a cached snapshot on the very first pump, before connecting',
+        (tester) async {
+          SharedPreferences.setMockInitialValues({});
+          final prefs = await SharedPreferences.getInstance();
+          ChannelMessageCacheStorage(prefs).writeChannel(
+            baseUrl: 'http://localhost:3000',
+            storedOrigin: 'http://localhost:3000',
+            pubkey: 'pk-cold-launch',
+            channelId: _channelId,
+            messages: [
+              _textMsg(
+                id: 'cached-1',
+                pubkey: 'alice',
+                content: 'Cached hello',
+              ),
+              _textMsg(
+                id: 'cached-2',
+                pubkey: 'bob',
+                content: 'Cached world',
+                createdAt: 1001,
+              ),
+            ],
+          );
+
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: const [],
+              overrideChannelMessagesProvider: false,
+              relaySessionNotifier: _TrackingRelaySession(),
+              prefsOverride: prefs,
+              myPubkeyOverride: 'pk-cold-launch',
+            ),
+          );
+          // The first pump only — not pumpAndSettle. SharedPreferences is
+          // preloaded synchronously (see main.dart), so the cached snapshot
+          // must already be on screen before anything settles.
+          await tester.pump();
+
+          expect(find.text('Cached hello'), findsOneWidget);
+          expect(find.text('Cached world'), findsOneWidget);
+          expect(find.text('No messages yet'), findsNothing);
+          expect(find.text("Can't reach Buzz"), findsNothing);
+        },
+      );
+
+      // This test builds a *fresh* ProviderScope per identity, so it only
+      // proves the two disk cache keys differ — it never switches an
+      // existing notifier's identity, so it cannot catch the in-memory
+      // `_lastKnownMessages ??= ...` leak across a live identity switch.
+      // See `does not leak in-memory messages across an identity switch on
+      // the same notifier` in channel_messages_provider_test.dart for that
+      // seam, driven directly against the real ChannelMessagesNotifier on a
+      // single ProviderContainer.
+      testWidgets('does not leak a cached snapshot across an identity switch', (
+        tester,
+      ) async {
+        SharedPreferences.setMockInitialValues({});
+        final prefs = await SharedPreferences.getInstance();
+        ChannelMessageCacheStorage(prefs).writeChannel(
+          baseUrl: 'http://localhost:3000',
+          storedOrigin: 'http://localhost:3000',
+          pubkey: 'pk-a',
+          channelId: _channelId,
+          messages: [
+            _textMsg(
+              id: 'a-secret',
+              pubkey: 'alice',
+              content: 'identity A private message',
+            ),
+          ],
+        );
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: const [],
+            overrideChannelMessagesProvider: false,
+            relaySessionNotifier: _TrackingRelaySession(),
+            prefsOverride: prefs,
+            myPubkeyOverride: 'pk-b',
+          ),
+        );
+        await tester.pump();
+
+        expect(find.text('identity A private message'), findsNothing);
+        // Identity B has no cache for this channel, so this must fall back
+        // to step 1's honest disconnected state, not a silent empty one.
+        expect(find.text("Can't reach Buzz"), findsOneWidget);
+        expect(find.text('No messages yet'), findsNothing);
+      });
+
+      testWidgets(
+        'still shows the disconnected state when there is no cached snapshot',
+        (tester) async {
+          SharedPreferences.setMockInitialValues({});
+          final prefs = await SharedPreferences.getInstance();
+
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: const [],
+              overrideChannelMessagesProvider: false,
+              relaySessionNotifier: _TrackingRelaySession(),
+              prefsOverride: prefs,
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          expect(find.text("Can't reach Buzz"), findsOneWidget);
+          expect(find.text('No messages yet'), findsNothing);
+        },
+      );
     });
 
     testWidgets('renders text messages with author and content', (
@@ -14419,6 +14621,17 @@ class _TrackingRelaySession extends RelaySessionNotifier {
       release();
     };
   }
+}
+
+class _ConnectedRelaySession extends RelaySessionNotifier {
+  @override
+  SessionState build() => const SessionState(status: SessionStatus.connected);
+
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) async => [];
 }
 
 class _ReconnectingRelaySession extends RelaySessionNotifier {

@@ -2,7 +2,9 @@ import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/relay/relay.dart';
+import '../../shared/theme/theme_provider.dart' show savedPrefsProvider;
 import 'channel_event_order.dart';
+import 'channel_message_cache/channel_message_cache_storage.dart';
 import 'pending_local_messages_provider.dart';
 import 'channel_window.dart';
 import 'thread_replies_provider.dart';
@@ -29,16 +31,29 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   final Map<String, NostrEvent> _deepLinkEvents = {};
   final Set<String> _retainedDeepLinkEventIds = {};
 
+  /// The identity/relay this instance's in-memory state was populated under.
+  /// `null` before the first `build()`, so the very first build never counts
+  /// as a "switch" (there is nothing to leak yet).
+  ({String? pubkey, String baseUrl})? _populatedFor;
+
   ChannelMessagesNotifier(this.channelId);
 
   /// Last successfully loaded messages, preserved across reconnections so the
   /// UI can show stale data instead of a blank loading spinner.
   List<NostrEvent>? _lastKnownMessages;
 
-  /// Whether this channel has completed at least one message history load.
+  /// Whether this channel has a last-known truth to show — not whether a
+  /// network load happened.
   ///
-  /// This distinguishes a genuinely loaded empty channel from the synthetic
-  /// empty value returned while the relay is not yet connected.
+  /// This distinguishes a channel we know about from the synthetic empty
+  /// value returned while the relay is not yet connected. A disk snapshot
+  /// sets it too, which is why it is phrased as last-known rather than
+  /// loaded: `_readCachedSnapshot` returns null for an empty snapshot and
+  /// writes skip empty lists, so `hasLoadedMessages && messages.isEmpty`
+  /// still means a network load came back empty. That invariant lives in
+  /// those two places, not here — if either changes, this getter's meaning
+  /// changes with it and the empty-state branch in `_MessageList` will need
+  /// splitting.
   bool get hasLoadedMessages => _lastKnownMessages != null;
 
   Map<String, ChannelWindowThreadSummary> get threadSummaries =>
@@ -46,6 +61,23 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
 
   @override
   AsyncValue<List<NostrEvent>> build() {
+    // This provider is a `NotifierProvider.family` keyed only by `channelId`,
+    // and it is not autoDispose: the same notifier instance survives an
+    // identity switch (same-relay identities share NIP-29 channel ids), so
+    // every in-memory field below is a potential cross-identity leak unless
+    // it's explicitly reset here. Watching identity + relay origin makes this
+    // build() re-run on a switch even while connected, which the previous
+    // relaySessionProvider-only watch did not guarantee.
+    final identityPubkey = ref.watch(myPubkeyProvider);
+    final identityBaseUrl = ref.watch(
+      relayConfigProvider.select((config) => config.baseUrl),
+    );
+    final identity = (pubkey: identityPubkey, baseUrl: identityBaseUrl);
+    if (_populatedFor != null && _populatedFor != identity) {
+      _resetForIdentitySwitch();
+    }
+    _populatedFor = identity;
+
     final sessionState = ref.watch(relaySessionProvider);
     ref.onDispose(() {
       _initVersion++;
@@ -57,6 +89,14 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       _initInFlight = false;
       _initialWindowQueryInFlight = false;
       _liveSummaryRootsDuringInitialWindowQuery.clear();
+      // A cold launch has no in-memory `_lastKnownMessages` yet, but a prior
+      // session may have left a disk snapshot for this exact channel. Reading
+      // it here (SharedPreferences is preloaded before `runApp`, so this is
+      // synchronous) lets the first frame paint real content instead of the
+      // disconnected placeholder. `_resetForIdentitySwitch` above clears
+      // `_lastKnownMessages` on an identity/relay change, so this re-reads
+      // for the new identity instead of keeping the old one's `??=` value.
+      _lastKnownMessages ??= _readCachedSnapshot();
       return AsyncData(_lastKnownMessages ?? const []);
     }
 
@@ -70,6 +110,44 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       return AsyncData(cached);
     }
     return const AsyncLoading();
+  }
+
+  /// Clears every in-memory field that is scoped to the previous identity or
+  /// relay before this build() serves the new one.
+  ///
+  /// - `_lastKnownMessages`: the actual leak — must be cleared so the
+  ///   disconnected branch's `??=` re-reads the new identity's disk cache
+  ///   (or shows nothing) instead of keeping the old identity's messages.
+  /// - `_windowStore`, `_usingChannelWindow`, `_reachedOldest`,
+  ///   `_initialWindowQueryInFlight`,
+  ///   `_liveSummaryRootsDuringInitialWindowQuery`: server-assembled window
+  ///   state for this channel on the *old* relay/identity. The `connected`
+  ///   branch below already zeros it on every build, so the reconnect path
+  ///   is not the reason to clear it here. The reasons are that
+  ///   `threadSummaries` is read straight off `_windowStore` on every
+  ///   `ChannelDetailPage` build — including while the new identity is still
+  ///   disconnected, which would show the old identity's reply counts — and
+  ///   that an in-flight writer can land after that zeroing (see the
+  ///   `_isCurrentInit` fences in `_fetchNewestHistory` and `fetchOlder`).
+  /// - `_deepLinkEvents` / `_retainedDeepLinkEventIds`: pinned events fetched
+  ///   for a deep link belong to whichever relay/identity fetched them.
+  /// - Subscription (`_clearSubscription`) and `_initInFlight`: an in-flight
+  ///   `_init()` or live subscription callback from the old identity's
+  ///   session must not be allowed to land and repopulate
+  ///   `_lastKnownMessages`/`state` after the switch; `_initVersion++` makes
+  ///   any such in-flight callback a no-op via `_isCurrentInit`.
+  void _resetForIdentitySwitch() {
+    _initVersion++;
+    _clearSubscription();
+    _initInFlight = false;
+    _lastKnownMessages = null;
+    _windowStore = const ChannelWindowStore.empty();
+    _usingChannelWindow = false;
+    _reachedOldest = false;
+    _initialWindowQueryInFlight = false;
+    _liveSummaryRootsDuringInitialWindowQuery.clear();
+    _deepLinkEvents.clear();
+    _retainedDeepLinkEventIds.clear();
   }
 
   Future<void> _init() async {
@@ -89,7 +167,15 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
             since: _currentUnixSeconds(),
             limit: 200,
           ),
-          _handleLiveEvent,
+          // Fenced to the init that opened it: `_clearSubscription()` stops
+          // future delivery on an identity switch, but a callback already
+          // dispatched for the previous identity can still be in flight, and
+          // `_handleLiveEvent` writes `_lastKnownMessages` and `_windowStore`
+          // directly.
+          (event, {bool authoritative = true}) {
+            if (!_isCurrentInit(initVersion)) return;
+            _handleLiveEvent(event, authoritative: authoritative);
+          },
         );
         if (!_isCurrentInit(initVersion)) {
           unsubscribe();
@@ -103,7 +189,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
         );
       }
 
-      final history = await _fetchNewestHistory(session);
+      final history = await _fetchNewestHistory(session, initVersion);
       if (!_isCurrentInit(initVersion)) return;
       _confirmLocalMessages(history.map((event) => event.id));
 
@@ -115,6 +201,9 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       ]);
       _lastKnownMessages = merged;
       state = AsyncData(merged);
+      // Snapshot on a successful load only — not on every live event, which
+      // would turn a busy channel into a write on every message.
+      if (merged.isNotEmpty) _writeCachedSnapshot(merged);
     } catch (e, st) {
       if (!_isCurrentInit(initVersion)) return;
       final fallbackMessages = state.value ?? _lastKnownMessages;
@@ -135,10 +224,17 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
 
   Future<List<NostrEvent>> _fetchNewestHistory(
     RelaySessionNotifier session,
+    int initVersion,
   ) async {
     try {
       _initialWindowQueryInFlight = true;
       final page = await _fetchWindowPage(session, null);
+      // An identity or relay switch during the await already reset this
+      // notifier's state. Installing this page would write the previous
+      // identity's window — including the live summaries retained below —
+      // back over it. The caller's own `_isCurrentInit` check happens after
+      // we return, which is too late for these fields.
+      if (!_isCurrentInit(initVersion)) return const [];
       _initialWindowQueryInFlight = false;
       _windowStore = replaceNewestChannelWindow(
         _windowStore,
@@ -150,6 +246,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       _reachedOldest = !channelWindowHasMore(_windowStore);
       return flattenChannelWindowEvents(_windowStore);
     } catch (error) {
+      if (!_isCurrentInit(initVersion)) return const [];
       _initialWindowQueryInFlight = false;
       _liveSummaryRootsDuringInitialWindowQuery.clear();
       debugPrint(
@@ -391,6 +488,48 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     return updated;
   }
 
+  /// Reads this channel's cached newest-message snapshot from disk, scoped to
+  /// the active identity and relay so a switch between them can never surface
+  /// another identity's messages.
+  ///
+  /// Returns null (and touches no storage) when there is no resolved
+  /// identity yet. There is no shared "no identity" bucket to fall back to:
+  /// that would let two different signed-out states, or a transient gap
+  /// before the real pubkey resolves, share one identity's cache. A null
+  /// result here just means this build sees no cache; `_lastKnownMessages
+  /// ??= ...` retries on the next build once a real pubkey is available.
+  List<NostrEvent>? _readCachedSnapshot() {
+    final pubkey = ref.read(myPubkeyProvider);
+    if (pubkey == null || pubkey.isEmpty) return null;
+    final config = ref.read(relayConfigProvider);
+    final cached = ChannelMessageCacheStorage(ref.read(savedPrefsProvider))
+        .readChannel(
+          baseUrl: config.baseUrl,
+          storedOrigin: config.storedOrigin,
+          pubkey: pubkey,
+          channelId: channelId,
+        );
+    return cached == null || cached.isEmpty ? null : cached;
+  }
+
+  /// Persists [messages] as this channel's newest-message snapshot, scoped to
+  /// the active identity and relay. Caller-side LRU across channels (entry
+  /// count and serialized bytes) is handled by [ChannelMessageCacheStorage].
+  ///
+  /// A no-op when there is no resolved identity — see [_readCachedSnapshot].
+  void _writeCachedSnapshot(List<NostrEvent> messages) {
+    final pubkey = ref.read(myPubkeyProvider);
+    if (pubkey == null || pubkey.isEmpty) return;
+    final config = ref.read(relayConfigProvider);
+    ChannelMessageCacheStorage(ref.read(savedPrefsProvider)).writeChannel(
+      baseUrl: config.baseUrl,
+      storedOrigin: config.storedOrigin,
+      pubkey: pubkey,
+      channelId: channelId,
+      messages: messages,
+    );
+  }
+
   bool _isCurrentInit(int initVersion) => initVersion == _initVersion;
 
   void _clearSubscription() {
@@ -459,6 +598,10 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
   Future<bool> fetchOlder() async {
     if (_reachedOldest || _initInFlight) return false;
 
+    // Pagination outlives its own awaits, so an identity or relay switch can
+    // land mid-fetch. Everything below writes instance state; none of it may
+    // run against a notifier that has since been reset for another identity.
+    final initVersion = _initVersion;
     final session = ref.read(relaySessionProvider.notifier);
     if (_usingChannelWindow) {
       final cursor = channelWindowNextCursor(_windowStore);
@@ -468,6 +611,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
       }
       try {
         final page = await _fetchWindowPage(session, cursor);
+        if (!_isCurrentInit(initVersion)) return false;
         _windowStore = appendOlderChannelWindow(_windowStore, page);
         _reachedOldest = !channelWindowHasMore(_windowStore);
         final flattened = _withDeepLinkEvents(
@@ -490,6 +634,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     final older = await session.fetchHistory(
       NostrFilters.messages(channelId, limit: 100, until: oldest),
     );
+    if (!_isCurrentInit(initVersion)) return false;
     if (older.isEmpty) {
       _reachedOldest = true;
       return false;

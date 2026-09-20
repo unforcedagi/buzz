@@ -625,6 +625,20 @@ class ComposeBar extends HookConsumerWidget {
               outgoing.pubkeys,
               mediaTags: [...payload.mediaTags, ...outgoing.referenceTags],
             );
+          } on RelayDisconnectedException {
+            if (cancellation.isCancelled) return;
+            if (context.mounted) uploadError.value = _offlineSendErrorMessage;
+            if (context.mounted &&
+                queueGeneration == uploadGeneration.value &&
+                draftRevision.value == clearedDraftRevision) {
+              attachments.value = draftAttachments;
+              retainedForRetry = true;
+              mentionMap.value
+                ..clear()
+                ..addAll(draftMentions);
+              controller.value = draftText;
+              focusNode.requestFocus();
+            }
           } catch (error) {
             if (cancellation.isCancelled) return;
             if (context.mounted) uploadError.value = _formatUploadError(error);
