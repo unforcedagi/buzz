@@ -357,7 +357,10 @@ mod tests {
             "",
             "connected-app-main",
         ] {
-            assert!(!is_main_label(label), "label {label:?} must not count as main");
+            assert!(
+                !is_main_label(label),
+                "label {label:?} must not count as main"
+            );
         }
     }
 
@@ -380,10 +383,12 @@ mod tests {
     fn refuses_a_cookie_the_hub_did_not_mark_http_only() {
         // Readable by scripts in the webview is exactly what must not happen.
         assert!(vet_hub_cookie("parachute_hub_session=abc; Path=/", "hub.example", true).is_err());
-        assert!(
-            vet_hub_cookie("parachute_hub_session=abc; Path=/; HttpOnly", "hub.example", true)
-                .is_ok()
-        );
+        assert!(vet_hub_cookie(
+            "parachute_hub_session=abc; Path=/; HttpOnly",
+            "hub.example",
+            true
+        )
+        .is_ok());
     }
 
     // ---- contract: the hub's own attributes survive the rebuild ----------
@@ -403,7 +408,10 @@ mod tests {
         .expect("pending cookie accepted");
         assert_eq!(pending.path(), Some("/login"));
         assert_eq!(pending.max_age().map(|d| d.whole_seconds()), Some(600));
-        assert_eq!(pending.same_site(), Some(tauri::webview::cookie::SameSite::Lax));
+        assert_eq!(
+            pending.same_site(),
+            Some(tauri::webview::cookie::SameSite::Lax)
+        );
 
         let session = vet_hub_cookie(
             "parachute_hub_session=s; HttpOnly; SameSite=Lax; Path=/; Max-Age=7776000",
@@ -433,11 +441,19 @@ mod tests {
 
     #[test]
     fn secure_follows_the_origin_scheme() {
-        let https = vet_hub_cookie("parachute_hub_session=s; HttpOnly; Path=/", "h.example", true)
-            .expect("accepted");
+        let https = vet_hub_cookie(
+            "parachute_hub_session=s; HttpOnly; Path=/",
+            "h.example",
+            true,
+        )
+        .expect("accepted");
         assert_eq!(https.secure(), Some(true));
-        let http = vet_hub_cookie("parachute_hub_session=s; HttpOnly; Path=/", "h.example", false)
-            .expect("accepted");
+        let http = vet_hub_cookie(
+            "parachute_hub_session=s; HttpOnly; Path=/",
+            "h.example",
+            false,
+        )
+        .expect("accepted");
         // Marking Secure over plain loopback HTTP would make WebKit drop it.
         assert_eq!(http.secure(), Some(false));
     }
