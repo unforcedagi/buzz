@@ -370,6 +370,9 @@ mod tests {
         for raw in [
             "session=abc; HttpOnly; Path=/",
             "parachute_hub_sessionx=abc; HttpOnly; Path=/",
+            "parachute_hub_pending_loginx=abc; HttpOnly; Path=/login",
+            "xparachute_hub_session=abc; HttpOnly; Path=/",
+            "Parachute_Hub_Session=abc; HttpOnly; Path=/",
             "csrf=abc; HttpOnly; Path=/",
         ] {
             assert!(
@@ -381,14 +384,46 @@ mod tests {
 
     #[test]
     fn refuses_a_cookie_the_hub_did_not_mark_http_only() {
-        // Readable by scripts in the webview is exactly what must not happen.
+        // Readable by scripts in the webview is exactly what must not happen —
+        // for the 2FA hop cookie as much as for the session.
         assert!(vet_hub_cookie("parachute_hub_session=abc; Path=/", "hub.example", true).is_err());
+        assert!(vet_hub_cookie(
+            "parachute_hub_pending_login=t; Path=/login; SameSite=Lax",
+            "hub.example",
+            true
+        )
+        .is_err());
         assert!(vet_hub_cookie(
             "parachute_hub_session=abc; Path=/; HttpOnly",
             "hub.example",
             true
         )
         .is_ok());
+    }
+
+    // The rebuild must hand back the hub's cookie — same name, same value —
+    // and must not lose HttpOnly on the way. A rebuild that re-derived the
+    // cookie from parts and dropped the flag would leave a session readable
+    // from the app page.
+    #[test]
+    fn keeps_name_value_and_http_only_on_both_hub_cookies() {
+        for (raw, name, value) in [
+            (
+                "parachute_hub_session=s3cr3t.v; HttpOnly; Path=/",
+                "parachute_hub_session",
+                "s3cr3t.v",
+            ),
+            (
+                "parachute_hub_pending_login=p3nd; HttpOnly; Path=/login",
+                "parachute_hub_pending_login",
+                "p3nd",
+            ),
+        ] {
+            let cookie = vet_hub_cookie(raw, "hub.example", true).expect("accepted");
+            assert_eq!(cookie.name(), name);
+            assert_eq!(cookie.value(), value);
+            assert_eq!(cookie.http_only(), Some(true), "{name} lost HttpOnly");
+        }
     }
 
     // ---- contract: the hub's own attributes survive the rebuild ----------
@@ -429,14 +464,37 @@ mod tests {
     // never widened to a parent domain.
     #[test]
     fn scopes_the_cookie_to_the_apps_own_host() {
-        let cookie = vet_hub_cookie(
-            "parachute_hub_session=s; HttpOnly; Path=/",
-            "uni.hub.example",
-            true,
-        )
-        .expect("accepted");
-        assert_eq!(cookie.domain(), Some("uni.hub.example"));
-        assert_ne!(cookie.domain(), Some("hub.example"));
+        // Two different hosts, so a hardcoded domain cannot pass.
+        for host in ["uni.hub.example", "other.example"] {
+            let cookie = vet_hub_cookie("parachute_hub_session=s; HttpOnly; Path=/", host, true)
+                .expect("accepted");
+            assert_eq!(cookie.domain(), Some(host));
+        }
+    }
+
+    // A `Domain` attribute the hub (or anything upstream of it) set is
+    // overwritten, never preserved: the cookie is scoped to the host the app
+    // surface was opened for, whatever the header said. `preserves_the_hubs_*`
+    // pins that the OTHER attributes survive; this pins the one that must not.
+    #[test]
+    fn overwrites_any_incoming_domain_with_the_apps_host() {
+        for (raw, host) in [
+            (
+                "parachute_hub_session=s; HttpOnly; Path=/; Domain=evil.test",
+                "uni.hub.example",
+            ),
+            (
+                "parachute_hub_session=s; HttpOnly; Path=/; Domain=hub.example",
+                "uni.hub.example",
+            ),
+            (
+                "parachute_hub_pending_login=t; HttpOnly; Path=/login; Domain=.example",
+                "other.example",
+            ),
+        ] {
+            let cookie = vet_hub_cookie(raw, host, true).expect("accepted");
+            assert_eq!(cookie.domain(), Some(host), "{raw:?} kept its Domain");
+        }
     }
 
     #[test]
